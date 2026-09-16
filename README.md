@@ -1,3 +1,3 @@
-# spscQ.c23 
+# spscQ.cpp23 
 
 A attempt at a modern cpp version of single producer single consumer queue. 
