@@ -86,7 +86,34 @@ public:
     SPSCQueue(SPSCQueue&&) = delete;                            // move ctor 
     SPSCQueue& operator=(SPSCQueue&&) = delete;                 // move assignment operator 
 
+    /// Producer only. A full queue returns false without constructing or moving T.
+    /// If construction throws, the slot is not published and the queue is unchanged.
+    template <typename... Args>
+        requires std::constructible_from<T, Args...>
+    [[nodiscard]] bool try_emplace(Args&&... args)
+            noexcept(std::is_nothrow_constructible_v<T, Args...>) {
+        const auto position = write_index_.load(std::memory_order_relaxed);
+        const auto next = advance(position);
+        if (next == cached_read_index_) {
+            // Acquire the consumer's destruction before reusing its released slots.
+            cached_read_index_ = read_index_.load(std::memory_order_acquire);
+            if (next == cached_read_index_) {
+                return false;
+            }
+        }
+
+        std::construct_at(slots_ + position, std::forward<Args>(args)...);
+        // Publish only a fully constructed object to the consumer.
+        write_index_.store(next, std::memory_order_release);
+        return true;
+    }
+
 private:
+    [[nodiscard]] size_type advance(size_type index) const noexcept {
+        ++index;
+        return index == ring_size_ ? 0 : index;
+    }
+
     [[no_unique_address]] allocator_type allocator_;
     T* allocation_ = nullptr;
     T* slots_ = nullptr;

@@ -1,0 +1,39 @@
+# CMake build directories and generated files
+/build/
+/build-*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+compile_commands.json
+
+# Compiled objects, libraries, and debug symbols
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.dSYM/
+
+# Executables built directly in the repository root
+/example
+/spsc23_tests
+
+# Local CMake settings
+CMakeUserPresets.json
+
+# Editor and macOS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*

@@ -1,0 +1,55 @@
+cmake_minimum_required(VERSION 3.25)
+
+project(spsc23 VERSION 0.1.0 LANGUAGES CXX)
+
+if(PROJECT_IS_TOP_LEVEL AND DEFINED CMAKE_CXX_STANDARD AND CMAKE_CXX_STANDARD LESS 23)
+    message(FATAL_ERROR "spsc23 requires C++23 or later")
+endif()
+if(NOT DEFINED CMAKE_CXX_STANDARD OR CMAKE_CXX_STANDARD LESS 23)
+    # This directory's defaults do not change an embedding project's settings.
+    # The interface compile feature upgrades only targets that link the queue.
+    set(CMAKE_CXX_STANDARD 23)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(SPSC23_BUILD_TESTS "Build the queue's tests" ${PROJECT_IS_TOP_LEVEL})
+set(SPSC23_SANITIZER "none" CACHE STRING "Sanitizer for project executables: none, address, thread")
+set_property(CACHE SPSC23_SANITIZER PROPERTY STRINGS none address thread)
+if(NOT SPSC23_SANITIZER MATCHES "^(none|address|thread)$")
+    message(FATAL_ERROR "SPSC23_SANITIZER must be none, address, or thread")
+endif()
+if(NOT SPSC23_SANITIZER STREQUAL "none" AND
+   (MSVC OR NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+    message(FATAL_ERROR "The sanitizer option requires GCC or Clang with a supported sanitizer runtime")
+endif()
+
+add_library(spsc23 INTERFACE)
+add_library(spsc23::spsc23 ALIAS spsc23)
+target_compile_features(spsc23 INTERFACE cxx_std_23)
+target_include_directories(spsc23 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+function(spsc23_add_executable target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE spsc23::spsc23)
+    if(MSVC)
+        # Cache-line alignment intentionally pads the queue and some test types.
+        target_compile_options(${target} PRIVATE /W4 /permissive- /wd4324)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    if(SPSC23_SANITIZER STREQUAL "address")
+        target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    elseif(SPSC23_SANITIZER STREQUAL "thread")
+        target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE -fsanitize=thread)
+    endif()
+endfunction()
+
+if(SPSC23_BUILD_TESTS)
+    enable_testing()
+    spsc23_add_executable(spsc23_tests tests/spsc_queue_test.cpp)
+    add_test(NAME spsc23.tests COMMAND spsc23_tests)
+    set_tests_properties(spsc23.tests PROPERTIES TIMEOUT 120)
+endif()
