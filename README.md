@@ -1,30 +1,5 @@
 # spscQ.cpp23 
 
-A attempt at a modern cpp version of single producer single consumer queue. 
+A header-only, bounded **single-producer, single-consumer FIFO queue for C++23 and later**. One thread constructs items; another reads and destroys them. The queue allocates its storage once, keeps the requested capacity, and uses acquire/release atomics to transfer ownership of occupied slots.
 
-
-```bash
-Producer thread                      Consumer thread
-      │                                    │
-      │ push(A)                            │
-      │ push(B)                            │
-      │ push(C)                            │
-      │                                    │
-      └───────> [ A ][ B ][ C ] ──────────>│
-                                           │ pop A
-                                           │ pop B
-                                           │ pop C
-```
-
-Only one thread is allowed to add elements, and only one thread is allowed to remove elements. 
-
-Because there is only one writer on each side, the queue can avoid 
-
-```cpp
-std::mutex
-std::lock_guard 
-std::condition_variable
-```
-
-and instead coordinate using just a couple of atomic indices. 
-
+A pipeline often has a simple boundary: one thread produces work and one thread processes it. A fixed-capacity queue makes that boundary explicit, limits queued work, and lets the application decide what happens when the consumer falls behind. Examples include handing decoded records to a processing stage, moving owned jobs to a worker, or passing messages from one event loop to another.
