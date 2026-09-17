@@ -108,6 +108,28 @@ public:
         return true;
     }
 
+    template <typename U>
+        requires std::constructible_from<T, U>
+    [[nodiscard]] bool try_push(U&& value)
+        noexcept(std::is_nothrow_constructible_v<T, U>) {
+        return try_emplace(std::forward<U>(value));
+    }
+
+     /// Producer only. Retries with scheduler yields; requires consumer progress.
+    template <typename... Args>
+        requires std::constructible_from<T, Args...>
+    void emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args...>) {
+        while (!try_emplace(std::forward<Args>(args)...)) {
+        std::this_thread::yield();
+        }
+    }
+
+    template <typename U>
+        requires std::constructible_from<T, U>
+    void push(U&& value) noexcept(std::is_nothrow_constructible_v<T, U>) {
+        emplace(std::forward<U>(value));
+    }
+
 private:
     [[nodiscard]] size_type advance(size_type index) const noexcept {
         ++index;

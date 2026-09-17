@@ -57,6 +57,21 @@ concept CanEmplace = requires(Q& queue, Args&&... args) {
   { queue.try_emplace(std::forward<Args>(args)...) } -> std::same_as<bool>;
 };
 
+template <class Q, class U>
+concept CanTryPush = requires(Q& queue, U&& value) {
+  { queue.try_push(std::forward<U>(value)) } -> std::same_as<bool>;
+};
+
+template <class Q, class... Args>
+concept CanBlockingEmplace = requires(Q& queue, Args&&... args) {
+  { queue.emplace(std::forward<Args>(args)...) } -> std::same_as<void>;
+};
+
+template <class Q, class U>
+concept CanPush = requires(Q& queue, U&& value) {
+  { queue.push(std::forward<U>(value)) } -> std::same_as<void>;
+};
+
 static_assert(!std::is_default_constructible_v<IntQueue>);
 static_assert(!std::is_convertible_v<std::size_t, IntQueue>);
 static_assert(!std::is_copy_constructible_v<IntQueue>);
@@ -78,6 +93,22 @@ static_assert(!CanEmplace<spsc23::SPSCQueue<Immovable>>);
 static_assert(!CanEmplace<IntQueue, std::unique_ptr<int>>);
 static_assert(noexcept(std::declval<IntQueue&>().try_emplace(1)));
 static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().try_emplace(1)));
+static_assert(CanTryPush<IntQueue, int&>);
+static_assert(CanPush<IntQueue, const int&>);
+static_assert(!CanTryPush<IntQueue, std::unique_ptr<int>>);
+static_assert(!CanPush<IntQueue, std::unique_ptr<int>>);
+static_assert(CanBlockingEmplace<spsc23::SPSCQueue<Immovable>, int>);
+static_assert(!CanBlockingEmplace<spsc23::SPSCQueue<Immovable>>);
+static_assert(CanTryPush<spsc23::SPSCQueue<std::unique_ptr<int>>, std::unique_ptr<int>>);
+static_assert(CanPush<spsc23::SPSCQueue<std::unique_ptr<int>>, std::unique_ptr<int>>);
+static_assert(!CanTryPush<spsc23::SPSCQueue<std::unique_ptr<int>>, std::unique_ptr<int>&>);
+static_assert(!CanPush<spsc23::SPSCQueue<std::unique_ptr<int>>, std::unique_ptr<int>&>);
+static_assert(noexcept(std::declval<IntQueue&>().try_push(1)));
+static_assert(noexcept(std::declval<IntQueue&>().emplace(1)));
+static_assert(noexcept(std::declval<IntQueue&>().push(1)));
+static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().try_push(1)));
+static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().emplace(1)));
+static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().push(1)));
 
 void test_construction_and_capacity() {
   check_throws<std::invalid_argument>([] { IntQueue queue(0); });
@@ -111,6 +142,59 @@ void test_immovable_and_move_only() {
   auto second = std::make_unique<int>(8);
   CHECK(!pointers.try_emplace(std::move(second)));
   CHECK(second != nullptr && *second == 8);
+}
+
+
+void test_try_push() {
+  for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
+    IntQueue queue(capacity);
+    for (std::size_t index = 0; index != capacity; ++index) {
+      const int value = static_cast<int>(index);
+      CHECK(queue.try_push(value));
+    }
+    CHECK(!queue.try_push(-1));
+    CHECK(!queue.try_push(-1));
+  }
+
+  spsc23::SPSCQueue<std::unique_ptr<int>> pointers(1);
+  auto first = std::make_unique<int>(7);
+  CHECK(pointers.try_push(std::move(first)));
+  CHECK(first == nullptr);
+  auto second = std::make_unique<int>(8);
+  CHECK(!pointers.try_push(std::move(second)));
+  CHECK(second != nullptr && *second == 8);
+}
+
+void test_push_and_emplace() {
+  // The original blocking-producer test alternates push and emplace. Until
+  // try_pop exists, provide room for every item so neither call waits forever.
+  for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
+    IntQueue queue(capacity);
+    for (std::size_t index = 0; index != capacity; ++index) {
+      int value = static_cast<int>(index);
+      if (index % 2 == 0) {
+        queue.push(value);
+      } else {
+        queue.emplace(value);
+      }
+    }
+    CHECK(!queue.try_push(-1));
+  }
+
+  spsc23::SPSCQueue<Immovable> immovable(1);
+  immovable.emplace(20);
+  CHECK(!immovable.try_emplace(30));
+
+  spsc23::SPSCQueue<std::unique_ptr<int>> pointers(2);
+  auto first = std::make_unique<int>(7);
+  pointers.push(std::move(first));
+  CHECK(first == nullptr);
+  auto second = std::make_unique<int>(8);
+  pointers.emplace(std::move(second));
+  CHECK(second == nullptr);
+  auto third = std::make_unique<int>(9);
+  CHECK(!pointers.try_push(std::move(third)));
+  CHECK(third != nullptr && *third == 9);
 }
 
 struct Tracked {
@@ -158,6 +242,29 @@ void test_lifetime_and_full_queue() {
   CHECK(Tracked::destroyed_ids[42] == 0);
 }
 
+void test_push_and_emplace_lifetime() {
+  CHECK(Tracked::alive == 0);
+  Tracked::constructed = Tracked::destroyed = 0;
+  Tracked::destroyed_ids.fill(0);
+  {
+    spsc23::SPSCQueue<Tracked> queue(3);
+    CHECK(queue.try_push(10));
+    queue.emplace(20);
+    queue.push(30);
+    CHECK(Tracked::constructed == 3);
+    CHECK(Tracked::alive == 3);
+    CHECK(!queue.try_push(42));
+    CHECK(Tracked::constructed == 3);
+  }
+  CHECK(Tracked::alive == 0);
+  CHECK(Tracked::destroyed == 3);
+  // Destruction observes the values constructed through all three methods.
+  CHECK(Tracked::destroyed_ids[10] == 1);
+  CHECK(Tracked::destroyed_ids[20] == 1);
+  CHECK(Tracked::destroyed_ids[30] == 1);
+  CHECK(Tracked::destroyed_ids[42] == 0);
+}
+
 struct ConstructionError {};
 
 struct ThrowOnConstruction {
@@ -189,6 +296,27 @@ void test_exceptions() {
   CHECK(ThrowOnConstruction::alive == 0);
 }
 
+void test_push_and_emplace_exceptions() {
+  {
+    spsc23::SPSCQueue<ThrowOnConstruction> queue(3);
+    check_throws<ConstructionError>([&] { static_cast<void>(queue.try_push(-1)); });
+    CHECK(ThrowOnConstruction::alive == 0);
+    CHECK(queue.try_push(1));
+    check_throws<ConstructionError>([&] { queue.emplace(-1); });
+    CHECK(ThrowOnConstruction::alive == 1);
+    queue.emplace(2);
+    check_throws<ConstructionError>([&] { queue.push(-1); });
+    CHECK(ThrowOnConstruction::alive == 2);
+    queue.push(3);
+    // Failed construction leaves each slot available; a full queue never
+    // invokes the throwing constructor through try_push.
+    CHECK(ThrowOnConstruction::alive == 3);
+    CHECK(!queue.try_push(-1));
+    CHECK(ThrowOnConstruction::alive == 3);
+  }
+  CHECK(ThrowOnConstruction::alive == 0);
+}
+
 struct alignas(256) OverAligned {
   explicit OverAligned(std::uint64_t initial) : value(initial) {
     CHECK(reinterpret_cast<std::uintptr_t>(this) % alignof(OverAligned) == 0);
@@ -209,8 +337,12 @@ void test_over_alignment_and_custom_cache_line() {
 int main() {
   test_construction_and_capacity();
   test_immovable_and_move_only();
+  test_try_push();
+  test_push_and_emplace();
   test_lifetime_and_full_queue();
+  test_push_and_emplace_lifetime();
   test_exceptions();
+  test_push_and_emplace_exceptions();
   test_over_alignment_and_custom_cache_line();
-  std::puts("All constructor/destructor and try_emplace tests passed.");
+  std::puts("All constructor/destructor, try_emplace, try_push, emplace, and push tests passed.");
 }
