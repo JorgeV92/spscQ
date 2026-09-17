@@ -62,12 +62,41 @@ public:
         slots_ = allocation_ + padding_slots;
     }
 
+    /*
+        Requires external synchronization: the producer and consumer must have
+        stopped, and no borrowed pointers may remain in use.
+        Relaxed loads are sufficient because no queue operation may run concurrently
+        with destruction.
+
+        Threads are already synchronized externally, so these loads only retrieve
+        the final indexes; no acquire/release synchronization is needed here.
+    */
+     ~SPSCQueue() noexcept {
+        auto position = read_index_.load(std::memory_order_relaxed);
+        const auto end = write_index_.load(std::memory_order_relaxed);
+        while (position != end) {
+            std::destroy_at(slots_ + position);
+            position = advance(position);
+        }
+        allocator_traits::deallocate(allocator_, allocation_, allocation_count_);
+    }
+
+    SPSCQueue(const SPSCQueue&) = delete;                       // copy ctor 
+    SPSCQueue& operator=(const SPSCQueue&) = delete;            // copy assignment operator
+    SPSCQueue(SPSCQueue&&) = delete;                            // move ctor 
+    SPSCQueue& operator=(SPSCQueue&&) = delete;                 // move assignment operator 
+
 private:
     [[no_unique_address]] allocator_type allocator_;
     T* allocation_ = nullptr;
     T* slots_ = nullptr;
     size_type allocation_count_ = 0;
     size_type ring_size_ = 0;
+
+    alignas(CacheLineSize) std::atomic<size_type> write_index_{0};
+    alignas(CacheLineSize) size_type cached_read_index_ = 0;
+    alignas(CacheLineSize) std::atomic<size_type> read_index_{0};
+    alignas(CacheLineSize) size_type cached_write_index_ = 0;
 };
 
 } 
