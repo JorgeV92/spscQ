@@ -129,6 +129,19 @@ public:
     void push(U&& value) noexcept(std::is_nothrow_constructible_v<T, U>) {
         emplace(std::forward<U>(value));
     }
+    
+    /// Consumer only. A borrowed pointer remains valid until pop() or destruction.
+    [[nodiscard]] T* front() noexcept {
+        const auto position = read_index_.load(std::memory_order_relaxed);
+        if (position == cached_write_index_) {
+        // Acquire the producer's construction before touching a published object.
+        cached_write_index_ = write_index_.load(std::memory_order_acquire);
+        if (position == cached_write_index_) {
+            return nullptr;
+        }
+        }
+        return slots_ + position;
+    }
 
 private:
     [[nodiscard]] size_type advance(size_type index) const noexcept {

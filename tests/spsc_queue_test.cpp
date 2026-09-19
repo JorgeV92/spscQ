@@ -109,6 +109,37 @@ static_assert(noexcept(std::declval<IntQueue&>().push(1)));
 static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().try_push(1)));
 static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().emplace(1)));
 static_assert(!noexcept(std::declval<spsc23::SPSCQueue<Immovable>&>().push(1)));
+static_assert(noexcept(std::declval<IntQueue&>().front()));
+static_assert(std::same_as<decltype(std::declval<IntQueue&>().front()), int*>);
+static_assert(std::same_as<decltype(std::declval<spsc23::SPSCQueue<Immovable>&>().front()),
+                           Immovable*>);
+
+void test_front() {
+  for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
+    IntQueue queue(capacity);
+    CHECK(queue.front() == nullptr);
+    CHECK(queue.front() == nullptr);
+    CHECK(queue.try_emplace(10));
+    auto* const first = queue.front();
+    CHECK(first != nullptr);
+    CHECK(*first == 10);
+    CHECK(queue.front() == first);
+
+    for (std::size_t index = 1; index != capacity; ++index) {
+      CHECK(queue.try_emplace(static_cast<int>(index) + 10));
+      CHECK(queue.front() == first);
+      CHECK(*queue.front() == 10);
+    }
+    CHECK(!queue.try_emplace(-1));
+    CHECK(queue.front() == first);
+    CHECK(*queue.front() == 10);
+    *first = 42;
+    CHECK(queue.front() == first);
+    CHECK(*queue.front() == 42);
+    // Reading or modifying the front does not remove it or free a slot.
+    CHECK(!queue.try_push(-1));
+  }
+}
 
 void test_construction_and_capacity() {
   check_throws<std::invalid_argument>([] { IntQueue queue(0); });
@@ -134,14 +165,28 @@ void test_immovable_and_move_only() {
   CHECK(queue.try_emplace(10));
   CHECK(queue.try_emplace(20));
   CHECK(!queue.try_emplace(30));
+  auto* const item = queue.front();
+  CHECK(item != nullptr);
+  CHECK(item->value == 10);
+  item->value = 11;
+  CHECK(queue.front() == item);
+  CHECK(queue.front()->value == 11);
 
   spsc23::SPSCQueue<std::unique_ptr<int>> pointers(1);
+  CHECK(pointers.front() == nullptr);
   auto first = std::make_unique<int>(7);
+  auto* const pointee = first.get();
   CHECK(pointers.try_emplace(std::move(first)));
   CHECK(first == nullptr);
+  auto* const stored = pointers.front();
+  CHECK(stored != nullptr);
+  CHECK(stored->get() == pointee);
+  CHECK(**stored == 7);
   auto second = std::make_unique<int>(8);
   CHECK(!pointers.try_emplace(std::move(second)));
   CHECK(second != nullptr && *second == 8);
+  CHECK(pointers.front() == stored);
+  CHECK(stored->get() == pointee);
 }
 
 
@@ -166,8 +211,7 @@ void test_try_push() {
 }
 
 void test_push_and_emplace() {
-  // The original blocking-producer test alternates push and emplace. Until
-  // try_pop exists, provide room for every item so neither call waits forever.
+  // Provide room for every item so neither blocking call waits forever.
   for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
     IntQueue queue(capacity);
     for (std::size_t index = 0; index != capacity; ++index) {
@@ -220,6 +264,7 @@ struct Tracked {
 void test_lifetime_and_full_queue() {
   {
     spsc23::SPSCQueue<Tracked> empty(3);
+    CHECK(empty.front() == nullptr);
     CHECK(Tracked::constructed == 0);
   }
   CHECK(Tracked::destroyed == 0);
@@ -233,6 +278,13 @@ void test_lifetime_and_full_queue() {
     CHECK(Tracked::alive == 3);
     CHECK(!queue.try_emplace(42));
     CHECK(Tracked::constructed == 3);
+    auto* const first = queue.front();
+    CHECK(first != nullptr);
+    CHECK(first->value == 0);
+    CHECK(queue.front() == first);
+    CHECK(Tracked::constructed == 3);
+    CHECK(Tracked::destroyed == 0);
+    CHECK(Tracked::alive == 3);
   }
   CHECK(Tracked::alive == 0);
   CHECK(Tracked::destroyed == 3);
@@ -269,7 +321,7 @@ struct ConstructionError {};
 
 struct ThrowOnConstruction {
   static inline int alive = 0;
-  explicit ThrowOnConstruction(int initial) {
+  explicit ThrowOnConstruction(int initial) : value(initial) {
     if (initial < 0) {
       throw ConstructionError{};
     }
@@ -278,20 +330,30 @@ struct ThrowOnConstruction {
   ThrowOnConstruction(const ThrowOnConstruction&) = delete;
   ThrowOnConstruction(ThrowOnConstruction&&) = delete;
   ~ThrowOnConstruction() noexcept { --alive; }
+  int value;
 };
 
 void test_exceptions() {
   {
     spsc23::SPSCQueue<ThrowOnConstruction> queue(2);
+    CHECK(queue.front() == nullptr);
     check_throws<ConstructionError>([&] { static_cast<void>(queue.try_emplace(-1)); });
+    CHECK(queue.front() == nullptr);
     CHECK(ThrowOnConstruction::alive == 0);
     CHECK(queue.try_emplace(1));
+    auto* const first = queue.front();
+    CHECK(first != nullptr);
+    CHECK(first->value == 1);
     check_throws<ConstructionError>([&] { static_cast<void>(queue.try_emplace(-1)); });
+    CHECK(queue.front() == first);
+    CHECK(queue.front()->value == 1);
     CHECK(ThrowOnConstruction::alive == 1);
     // Both slots remain usable after failed construction.
     CHECK(queue.try_emplace(2));
     CHECK(!queue.try_emplace(-1));
     CHECK(ThrowOnConstruction::alive == 2);
+    CHECK(queue.front() == first);
+    CHECK(queue.front()->value == 1);
   }
   CHECK(ThrowOnConstruction::alive == 0);
 }
@@ -326,15 +388,22 @@ struct alignas(256) OverAligned {
 
 void test_over_alignment_and_custom_cache_line() {
   spsc23::SPSCQueue<OverAligned, 128> queue(3);
+  CHECK(queue.front() == nullptr);
   CHECK(queue.try_emplace(0));
   CHECK(queue.try_emplace(1));
   CHECK(queue.try_emplace(2));
   CHECK(!queue.try_emplace(3));
+  auto* const item = queue.front();
+  CHECK(item != nullptr);
+  CHECK(reinterpret_cast<std::uintptr_t>(item) % alignof(OverAligned) == 0);
+  CHECK(item->value == 0);
+  CHECK(queue.front() == item);
 }
 
 }  // namespace
 
 int main() {
+  test_front();
   test_construction_and_capacity();
   test_immovable_and_move_only();
   test_try_push();
@@ -344,5 +413,5 @@ int main() {
   test_exceptions();
   test_push_and_emplace_exceptions();
   test_over_alignment_and_custom_cache_line();
-  std::puts("All constructor/destructor, try_emplace, try_push, emplace, and push tests passed.");
+  std::puts("All constructor/destructor, try_emplace, try_push, emplace, push, and front tests passed.");
 }
