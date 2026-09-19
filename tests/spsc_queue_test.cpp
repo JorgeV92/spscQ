@@ -1,6 +1,8 @@
 #include <spsc23/SPSCQueue.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -8,7 +10,9 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -48,6 +52,14 @@ struct Immovable {
 struct ThrowingDestructor {
   ~ThrowingDestructor() noexcept(false) {}
 };
+
+struct ThrowingMove {
+  ThrowingMove() = default;
+  ThrowingMove(ThrowingMove&&) noexcept(false) {}
+};
+
+template <class Q>
+concept HasTryPop = requires(Q& queue) { queue.try_pop(); };
 
 template <class T>
 concept CanStore = requires { typename spsc23::SPSCQueue<T>; };
@@ -113,6 +125,60 @@ static_assert(noexcept(std::declval<IntQueue&>().front()));
 static_assert(std::same_as<decltype(std::declval<IntQueue&>().front()), int*>);
 static_assert(std::same_as<decltype(std::declval<spsc23::SPSCQueue<Immovable>&>().front()),
                            Immovable*>);
+static_assert(HasTryPop<IntQueue>);
+static_assert(HasTryPop<spsc23::SPSCQueue<std::unique_ptr<int>>>);
+static_assert(!HasTryPop<spsc23::SPSCQueue<Immovable>>);
+static_assert(!HasTryPop<spsc23::SPSCQueue<ThrowingMove>>);
+static_assert(noexcept(std::declval<IntQueue&>().pop()));
+static_assert(noexcept(std::declval<IntQueue&>().try_pop()));
+static_assert(std::same_as<decltype(std::declval<IntQueue&>().pop()), void>);
+static_assert(std::same_as<decltype(std::declval<IntQueue&>().try_pop()), std::optional<int>>);
+
+void test_pop_and_try_pop_fifo() {
+  for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
+    IntQueue queue(capacity);
+    CHECK(!queue.try_pop());
+    CHECK(!queue.try_pop());
+    int value = 0;
+    for (int round = 0; round != 100; ++round) {
+      const int first = value;
+      for (std::size_t index = 0; index != capacity; ++index) {
+        CHECK(queue.try_push(value++));
+      }
+      CHECK(!queue.try_push(-1));
+      for (std::size_t index = 0; index != capacity; ++index) {
+        const int expected = first + static_cast<int>(index);
+        if (round % 2 == 0) {
+          auto* const item = queue.front();
+          CHECK(item != nullptr && *item == expected);
+          queue.pop();
+        } else {
+          const auto item = queue.try_pop();
+          CHECK(item && *item == expected);
+        }
+      }
+      CHECK(queue.front() == nullptr);
+      CHECK(!queue.try_pop());
+    }
+
+    // Reuse one released slot at a time while crossing the ring boundary.
+    for (std::size_t index = 0; index != capacity; ++index) {
+      CHECK(queue.try_emplace(static_cast<int>(index)));
+    }
+    for (int expected = 0; expected != 1000; ++expected) {
+      const auto item = queue.try_pop();
+      CHECK(item && *item == expected);
+      CHECK(queue.try_push(expected + static_cast<int>(capacity)));
+      CHECK(!queue.try_push(-1));
+    }
+    for (std::size_t index = 0; index != capacity; ++index) {
+      const auto item = queue.try_pop();
+      CHECK(item && *item == 1000 + static_cast<int>(index));
+    }
+    CHECK(queue.front() == nullptr);
+    CHECK(!queue.try_pop());
+  }
+}
 
 void test_front() {
   for (const std::size_t capacity : {1, 2, 3, 7, 16, 31, 128}) {
@@ -171,6 +237,10 @@ void test_immovable_and_move_only() {
   item->value = 11;
   CHECK(queue.front() == item);
   CHECK(queue.front()->value == 11);
+  queue.pop();
+  CHECK(queue.front() != nullptr && queue.front()->value == 20);
+  queue.pop();
+  CHECK(queue.front() == nullptr);
 
   spsc23::SPSCQueue<std::unique_ptr<int>> pointers(1);
   CHECK(pointers.front() == nullptr);
@@ -187,6 +257,20 @@ void test_immovable_and_move_only() {
   CHECK(second != nullptr && *second == 8);
   CHECK(pointers.front() == stored);
   CHECK(stored->get() == pointee);
+  const auto first_result = pointers.try_pop();
+  CHECK(first_result && first_result->get() == pointee && **first_result == 7);
+  CHECK(pointers.front() == nullptr);
+  pointers.push(std::move(second));
+  CHECK(second == nullptr);
+  const auto second_result = pointers.try_pop();
+  CHECK(second_result && *second_result && **second_result == 8);
+  CHECK(!pointers.try_pop());
+  // An occupied slot containing a null pointer still produces an engaged optional.
+  CHECK(pointers.try_emplace(nullptr));
+  const auto null_result = pointers.try_pop();
+  CHECK(null_result.has_value());
+  CHECK(*null_result == nullptr);
+  CHECK(!pointers.try_pop());
 }
 
 
@@ -252,9 +336,14 @@ struct Tracked {
     ++alive;
   }
   Tracked(const Tracked&) = delete;
-  Tracked(Tracked&&) = delete;
+  Tracked(Tracked&& other) noexcept : value(std::exchange(other.value, -1)) {
+    ++constructed;
+    ++alive;
+  }
   ~Tracked() noexcept {
-    ++destroyed_ids[static_cast<std::size_t>(value)];
+    if (value >= 0) {
+      ++destroyed_ids[static_cast<std::size_t>(value)];
+    }
     ++destroyed;
     --alive;
   }
@@ -317,6 +406,62 @@ void test_push_and_emplace_lifetime() {
   CHECK(Tracked::destroyed_ids[42] == 0);
 }
 
+void test_pop_lifetime_and_wraparound() {
+  CHECK(Tracked::alive == 0);
+  Tracked::constructed = Tracked::destroyed = 0;
+  Tracked::destroyed_ids.fill(0);
+  {
+    spsc23::SPSCQueue<Tracked> queue(3);
+    for (int value = 0; value != 3; ++value) {
+      CHECK(queue.try_emplace(value));
+    }
+    for (int value = 0; value != 2; ++value) {
+      CHECK(queue.front() != nullptr && queue.front()->value == value);
+      queue.pop();
+      CHECK(Tracked::alive == 2);
+      CHECK(Tracked::destroyed_ids[static_cast<std::size_t>(value)] == 1);
+      CHECK(queue.try_emplace(value + 3));
+    }
+    // The remaining live objects straddle the ring boundary at destruction.
+    CHECK(Tracked::alive == 3);
+  }
+  CHECK(Tracked::alive == 0);
+  CHECK(Tracked::constructed == 5);
+  CHECK(Tracked::destroyed == 5);
+  for (int value = 0; value != 5; ++value) {
+    CHECK(Tracked::destroyed_ids[static_cast<std::size_t>(value)] == 1);
+  }
+}
+
+void test_try_pop_lifetime() {
+  CHECK(Tracked::alive == 0);
+  Tracked::constructed = Tracked::destroyed = 0;
+  Tracked::destroyed_ids.fill(0);
+  {
+    const auto result = [] {
+      spsc23::SPSCQueue<Tracked> queue(1);
+      CHECK(!queue.try_pop());
+      CHECK(Tracked::constructed == 0);
+      CHECK(queue.try_emplace(5));
+      auto item = queue.try_pop();
+      CHECK(item && item->value == 5);
+      CHECK(queue.front() == nullptr);
+      CHECK(!queue.try_pop());
+      CHECK(Tracked::alive == 1);
+      CHECK(Tracked::destroyed_ids[5] == 0);
+      CHECK(queue.try_emplace(6));
+      return item;
+    }();
+    CHECK(result && result->value == 5);
+    CHECK(Tracked::alive == 1);
+    CHECK(Tracked::destroyed_ids[5] == 0);
+    CHECK(Tracked::destroyed_ids[6] == 1);
+  }
+  CHECK(Tracked::alive == 0);
+  CHECK(Tracked::constructed == Tracked::destroyed);
+  CHECK(Tracked::destroyed_ids[5] == 1);
+}
+
 struct ConstructionError {};
 
 struct ThrowOnConstruction {
@@ -354,6 +499,15 @@ void test_exceptions() {
     CHECK(ThrowOnConstruction::alive == 2);
     CHECK(queue.front() == first);
     CHECK(queue.front()->value == 1);
+    queue.pop();
+    CHECK(queue.front() != nullptr && queue.front()->value == 2);
+    queue.pop();
+    CHECK(queue.front() == nullptr);
+    CHECK(ThrowOnConstruction::alive == 0);
+    check_throws<ConstructionError>([&] { static_cast<void>(queue.try_emplace(-1)); });
+    CHECK(queue.front() == nullptr);
+    CHECK(queue.try_emplace(3));
+    CHECK(queue.front() != nullptr && queue.front()->value == 3);
   }
   CHECK(ThrowOnConstruction::alive == 0);
 }
@@ -388,30 +542,90 @@ struct alignas(256) OverAligned {
 
 void test_over_alignment_and_custom_cache_line() {
   spsc23::SPSCQueue<OverAligned, 128> queue(3);
+  for (std::uint64_t first = 0; first != 300; first += 3) {
+    CHECK(queue.front() == nullptr);
+    CHECK(queue.try_emplace(first));
+    CHECK(queue.try_emplace(first + 1));
+    CHECK(queue.try_emplace(first + 2));
+    CHECK(!queue.try_emplace(first + 3));
+    for (std::uint64_t offset = 0; offset != 3; ++offset) {
+      auto* const item = queue.front();
+      CHECK(item != nullptr);
+      CHECK(reinterpret_cast<std::uintptr_t>(item) % alignof(OverAligned) == 0);
+      CHECK(item->value == first + offset);
+      CHECK(queue.front() == item);
+      if (offset % 2 == 0) {
+        queue.pop();
+      } else {
+        const auto result = queue.try_pop();
+        CHECK(result && result->value == first + offset);
+      }
+    }
+    CHECK(queue.front() == nullptr);
+    CHECK(!queue.try_pop());
+  }
+}
+
+void test_blocking_producer() {
+  constexpr int count = 25'000;
+  IntQueue queue(1);
+  std::atomic<int> completed{0};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  std::jthread producer([&] {
+    for (int value = 0; value != count; ++value) {
+      if (value % 2 == 0) {
+        queue.push(value);
+      } else {
+        queue.emplace(value);
+      }
+    }
+    completed.fetch_add(1, std::memory_order_release);
+  });
+  std::jthread consumer([&] {
+    for (int expected = 0; expected != count; ++expected) {
+      if (expected % 2 == 0) {
+        std::optional<int> item;
+        while (!(item = queue.try_pop())) {
+          std::this_thread::yield();
+        }
+        CHECK(*item == expected);
+      } else {
+        int* item = nullptr;
+        while ((item = queue.front()) == nullptr) {
+          std::this_thread::yield();
+        }
+        CHECK(*item == expected);
+        queue.pop();
+      }
+    }
+    completed.fetch_add(1, std::memory_order_release);
+  });
+  while (completed.load(std::memory_order_acquire) != 2) {
+    CHECK(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+  producer.join();
+  consumer.join();
   CHECK(queue.front() == nullptr);
-  CHECK(queue.try_emplace(0));
-  CHECK(queue.try_emplace(1));
-  CHECK(queue.try_emplace(2));
-  CHECK(!queue.try_emplace(3));
-  auto* const item = queue.front();
-  CHECK(item != nullptr);
-  CHECK(reinterpret_cast<std::uintptr_t>(item) % alignof(OverAligned) == 0);
-  CHECK(item->value == 0);
-  CHECK(queue.front() == item);
+  CHECK(!queue.try_pop());
 }
 
 }  // namespace
 
 int main() {
   test_front();
+  test_pop_and_try_pop_fifo();
   test_construction_and_capacity();
   test_immovable_and_move_only();
   test_try_push();
   test_push_and_emplace();
   test_lifetime_and_full_queue();
   test_push_and_emplace_lifetime();
+  test_pop_lifetime_and_wraparound();
+  test_try_pop_lifetime();
   test_exceptions();
   test_push_and_emplace_exceptions();
   test_over_alignment_and_custom_cache_line();
-  std::puts("All constructor/destructor, try_emplace, try_push, emplace, push, and front tests passed.");
+  test_blocking_producer();
+  std::puts("All queue tests passed.");
 }

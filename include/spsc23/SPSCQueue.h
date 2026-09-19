@@ -143,6 +143,28 @@ public:
         return slots_ + position;
     }
 
+    /// Consumer only. Precondition: front() returned non-null for the current item.
+    void pop() noexcept {
+        assert(front() != nullptr && "spsc23::pop requires an observed, nonempty front");
+        const auto position = read_index_.load(std::memory_order_relaxed);
+        std::destroy_at(slots_ + position);
+        // Publish reclamation only after all access and destruction have completed.
+        read_index_.store(advance(position), std::memory_order_release);
+    }
+
+    /// Consumer only. Nothrow movement keeps extraction and removal unambiguous.
+    [[nodiscard]] std::optional<T> try_pop() noexcept
+        requires std::is_nothrow_move_constructible_v<T>
+    {
+        auto* item = front();
+        if (item == nullptr) {
+        return std::nullopt;
+        }
+        std::optional<T> result(std::in_place, std::move(*item));
+        pop();
+        return result;
+    }
+
 private:
     [[nodiscard]] size_type advance(size_type index) const noexcept {
         ++index;
